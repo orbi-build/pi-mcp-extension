@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1061,6 +1061,265 @@ describe("SessionLifecycle and pure lifecycle helpers", () => {
     } finally {
       registered = [];
       await lifecycle.handleSessionShutdown(ctx);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Issue #337: per-server config error isolation in SessionLifecycle", () => {
+  it("preserves global, project, and extension servers when .pi/mcp.json has an override targeting an extension server", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-mcp-337-ext-override-"));
+    const globalConfigPath = join(dir, "global-mcp.json");
+    const notifications: Array<{ msg: string; level: string }> = [];
+    const registered: RegisteredMcpServer[] = [serverEntry("ext_srv")];
+    const mockExt = createMockExtension({ mcpServers: registered });
+    (mockExt.api as unknown as { getMcpServers: () => RegisteredMcpServer[] }).getMcpServers = () =>
+      registered;
+    const ctx = createMockContext({
+      cwd: dir,
+      hasUI: true,
+      isProjectTrusted: () => true,
+      ui: {
+        notify: (msg: string, level: "info" | "warning" | "error") => {
+          notifications.push({ msg, level });
+        },
+      },
+    });
+
+    try {
+      await writeFile(
+        globalConfigPath,
+        JSON.stringify({
+          settings: { maxRetries: 0 },
+          mcpServers: {
+            global_srv: {
+              command: "node",
+              args: ["--import", tsxEsmLoader, mockServerPath],
+              lifecycle: "eager",
+            },
+          },
+        }),
+      );
+      await mkdir(join(dir, ".pi"), { recursive: true });
+      await writeFile(
+        join(dir, ".pi", "mcp.json"),
+        JSON.stringify({
+          mcpServers: {
+            ext_srv: { enabled: false },
+            proj_srv: {
+              command: "node",
+              args: ["--import", tsxEsmLoader, mockServerPath],
+              lifecycle: "eager",
+            },
+          },
+        }),
+      );
+
+      await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath });
+      await mockExt.events.get("session_start")({}, ctx);
+
+      const rows = JSON.parse(
+        (await mockExt.tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text,
+      ) as Array<{ name: string; state: string; source: string }>;
+      const byName = new Map(rows.map((r) => [r.name, r]));
+
+      assert.equal(byName.get("global_srv")?.state, "ready");
+      assert.equal(byName.get("global_srv")?.source, "global");
+      assert.equal(byName.get("proj_srv")?.state, "ready");
+      assert.equal(byName.get("proj_srv")?.source, "project");
+      assert.equal(byName.get("ext_srv")?.state, "ready");
+      assert.equal(byName.get("ext_srv")?.source, "extension");
+
+      const configErrors = notifications.filter((n) => n.msg.startsWith("pi-mcp: Config error —"));
+      assert.equal(configErrors.length, 1);
+      assert.ok(configErrors[0]?.msg.includes("mcpServers.ext_srv"));
+    } finally {
+      await mockExt.events.get("session_shutdown")?.({}, ctx);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("notifies per-server config errors on session_start even when configChanged is false and keeps healthy siblings ready", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-mcp-337-unchanged-"));
+    const globalConfigPath = join(dir, "global-mcp.json");
+    const notifications: Array<{ msg: string; level: string }> = [];
+    const mockExt = createMockExtension();
+    const ctx = createMockContext({
+      cwd: dir,
+      hasUI: true,
+      isProjectTrusted: () => true,
+      ui: {
+        notify: (msg: string, level: "info" | "warning" | "error") => {
+          notifications.push({ msg, level });
+        },
+      },
+    });
+
+    try {
+      await writeFile(
+        globalConfigPath,
+        JSON.stringify({
+          settings: { maxRetries: 0 },
+          mcpServers: {
+            healthy_srv: {
+              command: "node",
+              args: ["--import", tsxEsmLoader, mockServerPath],
+              lifecycle: "eager",
+            },
+            provider_srv: {
+              url: "https://mcp.example.com/mcp",
+              auth: { provider: "anthropic" },
+            },
+          },
+        }),
+      );
+
+      await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath });
+      await mockExt.events.get("session_start")({}, ctx);
+
+      const rows = JSON.parse(
+        (await mockExt.tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text,
+      ) as Array<{ name: string; state: string }>;
+      assert.deepEqual(
+        rows.map((r) => [r.name, r.state]),
+        [["healthy_srv", "ready"]],
+      );
+      assert.ok(mockExt.activeTools.includes("mcp_healthy_srv_echo"));
+
+      const configErrors = notifications.filter((n) => n.msg.startsWith("pi-mcp: Config error —"));
+      assert.equal(configErrors.length, 1);
+      assert.ok(configErrors[0]?.msg.includes("mcpServers.provider_srv.auth.provider"));
+    } finally {
+      await mockExt.events.get("session_shutdown")?.({}, ctx);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("tears down a server edited to become invalid on reload and drops a global server whose project override breaks", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-mcp-337-reload-"));
+    const globalConfigPath = join(dir, "global-mcp.json");
+    const notifications: Array<{ msg: string; level: string }> = [];
+    const mockExt = createMockExtension();
+    const ctx = createMockContext({
+      cwd: dir,
+      hasUI: true,
+      isProjectTrusted: () => true,
+      ui: {
+        notify: (msg: string, level: "info" | "warning" | "error") => {
+          notifications.push({ msg, level });
+        },
+      },
+    });
+
+    try {
+      await writeFile(
+        globalConfigPath,
+        JSON.stringify({
+          settings: { maxRetries: 0 },
+          mcpServers: {
+            foo: {
+              command: "node",
+              args: ["--import", tsxEsmLoader, mockServerPath],
+              lifecycle: "eager",
+            },
+            bar: {
+              command: "node",
+              args: ["--import", tsxEsmLoader, mockServerPath],
+              lifecycle: "eager",
+            },
+          },
+        }),
+      );
+
+      await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath });
+      await mockExt.events.get("session_start")({}, ctx);
+
+      let rows = JSON.parse(
+        (await mockExt.tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text,
+      ) as Array<{ name: string; state: string }>;
+      assert.deepEqual(
+        rows.map((r) => [r.name, r.state]).sort(),
+        [
+          ["bar", "ready"],
+          ["foo", "ready"],
+        ],
+      );
+
+      // 1. Edit global mcp.json so foo becomes invalid while bar stays valid
+      notifications.length = 0;
+      await writeFile(
+        globalConfigPath,
+        JSON.stringify({
+          settings: { maxRetries: 0 },
+          mcpServers: {
+            foo: {
+              url: "https://mcp.example.com/mcp",
+              auth: { provider: "anthropic" },
+            },
+            bar: {
+              command: "node",
+              args: ["--import", tsxEsmLoader, mockServerPath],
+              lifecycle: "eager",
+            },
+          },
+        }),
+      );
+      await mockExt.events.get("session_start")({}, ctx);
+
+      rows = JSON.parse(
+        (await mockExt.tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text,
+      ) as Array<{ name: string; state: string }>;
+      assert.deepEqual(
+        rows.map((r) => [r.name, r.state]),
+        [["bar", "ready"]],
+      );
+      assert.ok(!mockExt.activeTools.some((t) => t.startsWith("mcp_foo_")));
+      assert.ok(mockExt.activeTools.includes("mcp_bar_echo"));
+      assert.ok(
+        notifications.some((n) => n.msg.startsWith("pi-mcp: Config error —") && n.msg.includes("mcpServers.foo")),
+      );
+
+      // 2. Restore foo in global, then break foo in .pi/mcp.json with an invalid override:
+      // foo MUST be dropped (not fall back to global foo), while bar stays ready!
+      notifications.length = 0;
+      await writeFile(
+        globalConfigPath,
+        JSON.stringify({
+          settings: { maxRetries: 0 },
+          mcpServers: {
+            foo: {
+              command: "node",
+              args: ["--import", tsxEsmLoader, mockServerPath],
+              lifecycle: "eager",
+            },
+            bar: {
+              command: "node",
+              args: ["--import", tsxEsmLoader, mockServerPath],
+              lifecycle: "eager",
+            },
+          },
+        }),
+      );
+      await mkdir(join(dir, ".pi"), { recursive: true });
+      await writeFile(
+        join(dir, ".pi", "mcp.json"),
+        JSON.stringify({ mcpServers: { foo: { enable: false } } }),
+      );
+      await mockExt.events.get("session_start")({}, ctx);
+
+      rows = JSON.parse(
+        (await mockExt.tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text,
+      ) as Array<{ name: string; state: string }>;
+      assert.deepEqual(
+        rows.map((r) => [r.name, r.state]),
+        [["bar", "ready"]],
+      );
+      assert.ok(!mockExt.activeTools.some((t) => t.startsWith("mcp_foo_")));
+      assert.ok(
+        notifications.some((n) => n.msg.startsWith("pi-mcp: Config error —") && n.msg.includes("mcpServers.foo")),
+      );
+    } finally {
+      await mockExt.events.get("session_shutdown")?.({}, ctx);
       await rm(dir, { recursive: true, force: true });
     }
   });

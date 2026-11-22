@@ -253,8 +253,8 @@ sequenceDiagram
     Pi->>Entry: session_start(ctx)
     Entry->>Life: handleSessionStart(ctx)
     Life->>Coord: setActiveContext(ctx)
-    Life->>Cfg: loadConfigWithOrigins(cwd, globalPath, includeProjectConfig = isProjectTrusted())
-    Cfg-->>Life: merged McpConfig + origins or McpError
+    Life->>Cfg: loadSessionConfigWithOrigins(cwd, globalPath, includeProjectConfig = isProjectTrusted())
+    Cfg-->>Life: merged McpConfig + origins + serverErrors or McpError
     alt config invalid
         Life->>Coord: teardown(ctx)
         Life->>Bridge: updateSettings(default settings)
@@ -301,8 +301,14 @@ Key behaviors:
 
 - **Project trust.** `includeProjectConfig` is `ctx.isProjectTrusted()` on
   `session_start`; bootstrap and untrusted projects never read `<cwd>/.pi/mcp.json`.
-- **Invalid config** still tears down the previous session's servers, tools, prompts,
-  and status, then rebuilds from empty defaults rather than leaving stale state active.
+- **Invalid config.** Whole-file failures (I/O, JSON/JSONC syntax, non-object root or
+  `mcpServers`, or invalid `settings` / `autoEnableCodemode`) still tear down the previous
+  session's servers, tools, prompts, and status, then rebuild from empty defaults rather
+  than leaving stale state active. Individual `mcpServers.<name>` validation errors and
+  invalid/unknown project overrides are isolated into per-server `Config error`
+  notifications (`loadSessionConfigWithOrigins`), dropping any global server whose project
+  entry fails rather than falling back to global while keeping all healthy sibling servers
+  active.
 - **Config changed** tears everything down, applies `ToolBridge.updateSettings`, and
   rebuilds the server map from the new config.
 - **Config identical** still refreshes roots: `ServerManager.updateCwd()` notifies ready
@@ -492,13 +498,7 @@ Behavior:
 - **Extension-registered servers** from `pi.registerMcpServer()` are collected on
   bootstrap and on every `mcp_servers_change`; a same-named `mcp.json` entry takes
   precedence.
-- **Provenance.** `loadConfigWithOrigins()` returns the merged config plus the winning
-  file origin per server (`global` or `project`); `SessionLifecycle` merges in the
-  registered extension server names (`withExtensionServers`) and keeps that record for
-  the current session. `/mcp <name>` and `mcp_status` report it as `Source` / `source`, and a
-  skipped project config renders as `Project config: not loaded (<path>)` instead of
-  silently missing servers. `loadConfig()` remains the thin wrapper that returns only
-  the merged config.
+- **Provenance & per-server isolation.** `loadSessionConfigWithOrigins()` isolates individual `mcpServers.<name>` validation errors and invalid/unknown project overrides into `serverErrors` (dropping any global server whose project override or replacement fails rather than falling back to global), while throwing `McpError("config")` only on whole-file errors; `loadConfigWithOrigins()` returns the merged config plus the winning file origin per server (`global` or `project`) and keeps the strict throwing contract. `SessionLifecycle` merges in the registered extension server names (`withExtensionServers`) and keeps that record for the current session. `/mcp <name>` and `mcp_status` report it as `Source` / `source`, and a skipped project config renders as `Project config: not loaded (<path>)` instead of silently missing servers. `loadConfig()` remains the thin wrapper that returns only the strictly validated merged config.
 
 ---
 

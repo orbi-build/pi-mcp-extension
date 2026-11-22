@@ -13,11 +13,12 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import {
-  loadConfigWithOrigins,
+  loadSessionConfigWithOrigins,
   parseRegisteredServerConfig,
   type LoadedConfig,
   type McpConfig,
   type ServerConfig,
+  type SessionConfigLoadResult,
 } from "./config.js";
 import {
   withExtensionServers,
@@ -156,11 +157,14 @@ export async function loadBootstrapConfigState(
     projectConfigIncluded: false,
   };
   try {
-    const loaded = await loadConfigWithOrigins(bootstrapCwd, paths.globalConfigPath, {
+    const result = await loadSessionConfigWithOrigins(bootstrapCwd, paths.globalConfigPath, {
       includeProjectConfig: false,
     });
-    fileConfig = loaded.config;
-    fileProvenance = loaded;
+    fileConfig = result.loaded.config;
+    fileProvenance = result.loaded;
+    for (const err of result.serverErrors) {
+      reportBootstrapConfigError(err);
+    }
   } catch (err) {
     // Can't notify yet (no ctx), so the diagnostic goes to stderr (and to the
     // debug log when it is enabled). The session_start handler will re-try with
@@ -630,9 +634,9 @@ export class SessionLifecycle {
     });
     const includeProjectConfig = isProjectTrusted(ctx);
 
-    let nextLoaded: LoadedConfig;
+    let result: SessionConfigLoadResult;
     try {
-      nextLoaded = await loadConfigWithOrigins(ctx.cwd, this.deps.globalConfigPath, {
+      result = await loadSessionConfigWithOrigins(ctx.cwd, this.deps.globalConfigPath, {
         includeProjectConfig,
       });
     } catch (err) {
@@ -640,7 +644,10 @@ export class SessionLifecycle {
       return;
     }
     if (!this.isEpochCurrent(epoch)) return;
-    await this.applyLoadedSessionConfig(ctx, nextLoaded, epoch);
+    for (const err of result.serverErrors) {
+      notifySessionConfigError(ctx, err);
+    }
+    await this.applyLoadedSessionConfig(ctx, result.loaded, epoch);
   }
 
   private handleReconcileError(err: unknown, epoch: number, ctx: ExtensionContext): void {

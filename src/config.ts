@@ -19,8 +19,11 @@ import { z } from "zod";
 import { callbackServerConfigFromRedirectUrl } from "./callback-url.js";
 import {
   applyProjectOverrides,
+  isPlainObject,
+  isProjectOverrideEntry,
   normalizeAuthConfigAliases,
   normalizeServerConfigAliases,
+  resolveProjectOverride,
   withRegisteredServerLifecycle,
 } from "./config-compat.js";
 import { McpError } from "./errors.js";
@@ -268,6 +271,17 @@ const ProjectConfigSchema = z.object({
 });
 type ProjectConfig = z.output<typeof ProjectConfigSchema>;
 
+const McpConfigEnvelopeSchema = z.object({
+  settings: SettingsSchema.default(() => ({ ...DEFAULT_SETTINGS })),
+  mcpServers: z.record(z.string(), z.unknown()).default({}),
+  autoEnableCodemode: z.boolean().optional(),
+});
+const ProjectConfigEnvelopeSchema = z.object({
+  settings: ProjectSettingsSchema.default({}),
+  mcpServers: z.record(z.string(), z.unknown()).default({}),
+  autoEnableCodemode: z.boolean().optional(),
+});
+
 // ─── Public Types ─────────────────────────────────────────────────────────────
 
 export type AuthConfig = z.output<typeof AuthConfigSchema>;
@@ -297,6 +311,12 @@ export interface LoadConfigOptions {
    * Default: `true`.
    */
   includeProjectConfig?: boolean;
+}
+
+/** Result of fault-tolerant session config loading with isolated per-server errors. */
+export interface SessionConfigLoadResult {
+  loaded: LoadedConfig;
+  serverErrors: McpError[];
 }
 
 // ─── Loader ───────────────────────────────────────────────────────────────────
@@ -422,6 +442,189 @@ function originsOf(
     origins[name] = "project";
   }
   return origins;
+}
+
+function setOwnProperty<T>(target: Record<string, T>, key: string, value: T): void {
+  Object.defineProperty(target, key, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+}
+
+function extractRawServers(raw: unknown): Record<string, unknown> {
+  return isPlainObject(raw) && isPlainObject(raw.mcpServers) ? raw.mcpServers : {};
+}
+
+function formatServerValidationError(
+  name: string,
+  issues: z.ZodError["issues"],
+  sourcePath: string,
+): McpError {
+  const formatted = issues
+    .map((i) => `  mcpServers.${name}${i.path.length > 0 ? `.${i.path.join(".")}` : ""}: ${i.message}`)
+    .join("\n");
+  return new McpError(`Invalid mcp.json at ${sourcePath}:\n${formatted}`, "<config>", "config");
+}
+
+function parseGlobalServersTolerant(
+  rawServers: Record<string, unknown>,
+  sourcePath: string,
+): { servers: Record<string, ServerConfig>; errors: McpError[] } {
+  const servers: Record<string, ServerConfig> = {};
+  const errors: McpError[] = [];
+  for (const [name, entry] of Object.entries(rawServers)) {
+    const result = ServerConfigSchema.safeParse(entry);
+    if (result.success) {
+      setOwnProperty(servers, name, result.data);
+    } else {
+      errors.push(formatServerValidationError(name, result.error.issues, sourcePath));
+    }
+  }
+  return { servers, errors };
+}
+
+function parseProjectServerEntry(
+  name: string,
+  entry: unknown,
+  globalRawServers: Record<string, unknown>,
+  sourcePath: string,
+): { ok: true; value: ServerConfig } | { ok: false; error: McpError } {
+  let candidate = entry;
+  if (isProjectOverrideEntry(entry)) {
+    const resolved = resolveProjectOverride(name, entry, globalRawServers, sourcePath);
+    if (!resolved.ok) {
+      return resolved;
+    }
+    candidate = resolved.value;
+  }
+  const parsed = ServerConfigSchema.safeParse(candidate);
+  if (!parsed.success) {
+    return { ok: false, error: formatServerValidationError(name, parsed.error.issues, sourcePath) };
+  }
+  return { ok: true, value: parsed.data };
+}
+
+function parseProjectServersTolerant(
+  rawServers: Record<string, unknown>,
+  globalRawServers: Record<string, unknown>,
+  sourcePath: string,
+): { servers: Record<string, ServerConfig>; droppedNames: Set<string>; errors: McpError[] } {
+  const servers: Record<string, ServerConfig> = {};
+  const droppedNames = new Set<string>();
+  const errors: McpError[] = [];
+  for (const [name, entry] of Object.entries(rawServers)) {
+    const parsed = parseProjectServerEntry(name, entry, globalRawServers, sourcePath);
+    if (parsed.ok) {
+      setOwnProperty(servers, name, parsed.value);
+    } else {
+      droppedNames.add(name);
+      errors.push(parsed.error);
+    }
+  }
+  return { servers, droppedNames, errors };
+}
+
+function filterDroppedServers(
+  servers: Record<string, ServerConfig>,
+  droppedNames: ReadonlySet<string>,
+): Record<string, ServerConfig> {
+  if (droppedNames.size === 0) return servers;
+  const filtered: Record<string, ServerConfig> = {};
+  for (const [name, cfg] of Object.entries(servers)) {
+    if (!droppedNames.has(name)) {
+      setOwnProperty(filtered, name, cfg);
+    }
+  }
+  return filtered;
+}
+
+function mergeSessionConfigs(
+  globalCfg: McpConfig,
+  projectCfg: ProjectConfig,
+  droppedNames: ReadonlySet<string>,
+): McpConfig {
+  // WHY: a broken project override or replacement must drop the global server of that name
+  // rather than silently falling back to un-overridden global settings or credentials.
+  const keptGlobal: McpConfig = droppedNames.size === 0
+    ? globalCfg
+    : { ...globalCfg, mcpServers: filterDroppedServers(globalCfg.mcpServers, droppedNames) };
+  return mergeConfigs(keptGlobal, projectCfg);
+}
+
+function sessionOriginsOf(
+  globalCfg: McpConfig,
+  projectCfg: ProjectConfig | undefined,
+  droppedNames: ReadonlySet<string>,
+): Record<string, FileConfigOrigin> {
+  const origins: Record<string, FileConfigOrigin> = {};
+  for (const name of Object.keys(globalCfg.mcpServers)) {
+    if (!droppedNames.has(name)) {
+      setOwnProperty(origins, name, "global");
+    }
+  }
+  for (const name of Object.keys(projectCfg?.mcpServers ?? {})) {
+    setOwnProperty(origins, name, "project");
+  }
+  return origins;
+}
+
+/**
+ * Load and merge global and project configs for a session, isolating per-server validation errors
+ * and invalid project overrides so healthy sibling servers stay loaded. Whole-file errors (I/O,
+ * JSON syntax, non-object root/`mcpServers`, invalid `settings` or `autoEnableCodemode`) still
+ * throw `McpError("config")`.
+ */
+export async function loadSessionConfigWithOrigins(
+  cwd: string,
+  globalPath = join(agentDir(), "mcp.json"),
+  options?: LoadConfigOptions,
+): Promise<SessionConfigLoadResult> {
+  const projectConfigIncluded = options?.includeProjectConfig !== false;
+  const projectConfigPath = join(cwd, ".pi", "mcp.json");
+
+  const [globalRaw, projectRaw] = await Promise.all([
+    readJsonFile(globalPath),
+    projectConfigIncluded ? readJsonFile(projectConfigPath) : Promise.resolve(undefined),
+  ]);
+
+  const serverErrors: McpError[] = [];
+  const globalEnvelope = globalRaw !== undefined
+    ? parseWith(McpConfigEnvelopeSchema, globalRaw, globalPath)
+    : McpConfigEnvelopeSchema.parse({});
+  const globalRawServers = extractRawServers(globalRaw);
+  const globalParsed = parseGlobalServersTolerant(globalRawServers, globalPath);
+  serverErrors.push(...globalParsed.errors);
+  const globalCfg: McpConfig = { ...globalEnvelope, mcpServers: globalParsed.servers };
+
+  let projectCfg: ProjectConfig | undefined;
+  const droppedNames = new Set<string>();
+  if (projectRaw !== undefined) {
+    const projectEnvelope = parseWith(ProjectConfigEnvelopeSchema, projectRaw, projectConfigPath);
+    const projectParsed = parseProjectServersTolerant(
+      extractRawServers(projectRaw),
+      globalRawServers,
+      projectConfigPath,
+    );
+    serverErrors.push(...projectParsed.errors);
+    for (const name of projectParsed.droppedNames) {
+      droppedNames.add(name);
+    }
+    projectCfg = { ...projectEnvelope, mcpServers: projectParsed.servers };
+  }
+
+  return {
+    loaded: {
+      config: projectCfg === undefined
+        ? globalCfg
+        : mergeSessionConfigs(globalCfg, projectCfg, droppedNames),
+      origins: sessionOriginsOf(globalCfg, projectCfg, droppedNames),
+      projectConfigPath,
+      projectConfigIncluded,
+    },
+    serverErrors,
+  };
 }
 
 /**

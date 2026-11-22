@@ -13,6 +13,7 @@ import {
   agentDir,
   loadConfig as loadConfigFile,
   loadConfigWithOrigins,
+  loadSessionConfigWithOrigins,
   parseRegisteredServerConfig,
 } from "../src/config.js";
 import { stripJsonComments } from "../src/jsonc.js";
@@ -1300,6 +1301,200 @@ describe("Issue #215: Pi 1.3.0 config interoperability", () => {
       });
 
       await assert.rejects(() => loadConfig(dir), expectConfigError("clientName"));
+    });
+  });
+});
+
+describe("Issue #337: loadSessionConfigWithOrigins per-server error isolation", () => {
+  const globalConfigPath = (dir: string): string => join(dir, "isolated-global-mcp.json");
+
+  async function writeGlobalConfig(dir: string, content: unknown): Promise<void> {
+    await writeFile(globalConfigPath(dir), JSON.stringify(content));
+  }
+
+  it("isolates invalid global servers (auth.provider, bad redirectUrl) while keeping healthy siblings", async () => {
+    await withTempDir(async (dir) => {
+      const gPath = globalConfigPath(dir);
+      await writeGlobalConfig(dir, {
+        mcpServers: {
+          healthy_stdio: { command: "node", args: ["ok.js"], lifecycle: "eager" },
+          bad_provider: { url: "https://mcp.example.com/mcp", auth: { provider: "anthropic" } },
+          bad_redirect: {
+            url: "https://other.example.com/mcp",
+            oauth: { callbackUrl: "http://127.0.0.1:8080/oauth/callback" },
+          },
+          healthy_http: { url: "https://valid.example.com/mcp" },
+        },
+      });
+
+      const result = await loadSessionConfigWithOrigins(dir, gPath, { includeProjectConfig: true });
+
+      assert.deepEqual(Object.keys(result.loaded.config.mcpServers).sort(), [
+        "healthy_http",
+        "healthy_stdio",
+      ]);
+      assert.deepEqual(result.loaded.origins, {
+        healthy_stdio: "global",
+        healthy_http: "global",
+      });
+      assert.equal(result.serverErrors.length, 2);
+      for (const err of result.serverErrors) {
+        assert.ok(err instanceof McpError);
+        assert.equal(err.code, "config");
+        assert.equal(err.server, "<config>");
+        assert.ok(err.message.includes(gPath), `Expected global path in ${err.message}`);
+      }
+      assert.ok(result.serverErrors.some((e) => e.message.includes("mcpServers.bad_provider.auth.provider")));
+      assert.ok(result.serverErrors.some((e) => e.message.includes("mcpServers.bad_redirect.auth.redirectUrl")));
+
+      // Strict loaders continue throwing on the same config
+      await assert.rejects(() => loadConfigWithOrigins(dir, gPath), McpError);
+      await assert.rejects(() => loadConfigFile(dir, gPath), McpError);
+    });
+  });
+
+  it("isolates stale project overrides while keeping global and valid project servers", async () => {
+    await withTempDir(async (dir) => {
+      const gPath = globalConfigPath(dir);
+      await writeGlobalConfig(dir, {
+        mcpServers: {
+          global_ok: { command: "node", args: ["g.js"], lifecycle: "eager" },
+        },
+      });
+      await writeMcpJson(dir, {
+        mcpServers: {
+          deleted_srv: { enabled: false },
+          proj_ok: { command: "node", args: ["p.js"], lifecycle: "eager" },
+        },
+      });
+
+      const result = await loadSessionConfigWithOrigins(dir, gPath, { includeProjectConfig: true });
+      const projPath = result.loaded.projectConfigPath;
+
+      assert.deepEqual(Object.keys(result.loaded.config.mcpServers).sort(), ["global_ok", "proj_ok"]);
+      assert.deepEqual(result.loaded.origins, { global_ok: "global", proj_ok: "project" });
+      assert.equal(result.serverErrors.length, 1);
+      assert.equal(result.serverErrors[0]?.code, "config");
+      assert.ok(result.serverErrors[0]?.message.includes(projPath));
+      assert.ok(result.serverErrors[0]?.message.includes("mcpServers.deleted_srv"));
+
+      await assert.rejects(() => loadConfigWithOrigins(dir, gPath), McpError);
+    });
+  });
+
+  it("drops global servers whose project override or replacement is invalid instead of falling back to global", async () => {
+    await withTempDir(async (dir) => {
+      const gPath = globalConfigPath(dir);
+      await writeGlobalConfig(dir, {
+        mcpServers: {
+          g1_typo: { command: "node", args: ["g1.js"], lifecycle: "eager" },
+          g2_keep: { command: "node", args: ["g2.js"], lifecycle: "eager" },
+          g3_bad_replace: { command: "node", args: ["g3.js"], lifecycle: "eager" },
+          g4_bad_exposure: { command: "node", args: ["g4.js"], lifecycle: "eager" },
+        },
+      });
+      await writeMcpJson(dir, {
+        mcpServers: {
+          g1_typo: { enable: false },
+          g3_bad_replace: { url: "not-a-valid-url" },
+          g4_bad_exposure: { exposure: "bogus" },
+          proj_ok: { command: "node", args: ["p.js"] },
+        },
+      });
+
+      const result = await loadSessionConfigWithOrigins(dir, gPath, { includeProjectConfig: true });
+      const projPath = result.loaded.projectConfigPath;
+
+      assert.deepEqual(Object.keys(result.loaded.config.mcpServers).sort(), ["g2_keep", "proj_ok"]);
+      assert.deepEqual(result.loaded.origins, { g2_keep: "global", proj_ok: "project" });
+      assert.equal(result.loaded.config.mcpServers["g1_typo"], undefined);
+      assert.equal(result.loaded.config.mcpServers["g3_bad_replace"], undefined);
+      assert.equal(result.loaded.config.mcpServers["g4_bad_exposure"], undefined);
+
+      assert.equal(result.serverErrors.length, 3);
+      for (const err of result.serverErrors) {
+        assert.equal(err.code, "config");
+        assert.ok(err.message.includes(projPath));
+      }
+      assert.ok(result.serverErrors.some((e) => e.message.includes("mcpServers.g1_typo")));
+      assert.ok(result.serverErrors.some((e) => e.message.includes("mcpServers.g3_bad_replace")));
+      assert.ok(result.serverErrors.some((e) => e.message.includes("mcpServers.g4_bad_exposure")));
+    });
+  });
+
+  it("handles a partial project override targeting an invalid global server without misleading missing-command errors", async () => {
+    await withTempDir(async (dir) => {
+      const gPath = globalConfigPath(dir);
+      await writeGlobalConfig(dir, {
+        mcpServers: {
+          g_bad: { url: "https://mcp.example.com/mcp", auth: { provider: "anthropic" } },
+          g_ok: { command: "node", args: ["ok.js"] },
+        },
+      });
+      await writeMcpJson(dir, {
+        mcpServers: {
+          g_bad: { enabled: false },
+        },
+      });
+
+      const result = await loadSessionConfigWithOrigins(dir, gPath, { includeProjectConfig: true });
+      assert.deepEqual(Object.keys(result.loaded.config.mcpServers), ["g_ok"]);
+      assert.equal(result.loaded.config.mcpServers["g_bad"], undefined);
+      assert.ok(result.serverErrors.length >= 1);
+      assert.ok(result.serverErrors.every((e) => e.message.includes("auth.provider")));
+      assert.ok(result.serverErrors.every((e) => !e.message.includes("needs \"command\" or \"url\"")));
+    });
+  });
+
+  it("safely isolates __proto__ project overrides without polluting Object.prototype or dropping siblings", async () => {
+    await withTempDir(async (dir) => {
+      const gPath = globalConfigPath(dir);
+      await writeGlobalConfig(dir, {
+        mcpServers: {
+          g_ok: { command: "node", args: ["ok.js"] },
+        },
+      });
+      await mkdir(join(dir, ".pi"), { recursive: true });
+      await writeFile(
+        join(dir, ".pi", "mcp.json"),
+        '{"mcpServers":{"__proto__":{"enabled":false},"proj_ok":{"command":"node"}}}',
+      );
+
+      const result = await loadSessionConfigWithOrigins(dir, gPath, { includeProjectConfig: true });
+      assert.equal(Object.prototype.hasOwnProperty.call(Object.prototype, "enabled"), false);
+      assert.deepEqual(Object.keys(result.loaded.config.mcpServers).sort(), ["g_ok", "proj_ok"]);
+      assert.equal(result.serverErrors.length, 1);
+      assert.ok(result.serverErrors[0]?.message.includes("mcpServers.__proto__"));
+    });
+  });
+
+  it("still throws McpError('config') on whole-file syntax and envelope errors", async () => {
+    await withTempDir(async (dir) => {
+      const gPath = globalConfigPath(dir);
+      const invalidPayloads: string[] = [
+        "{ broken json",
+        "[]",
+        JSON.stringify({ mcpServers: ["not-an-object"] }),
+        JSON.stringify({ settings: { toolPrefix: "1bad" }, mcpServers: {} }),
+        JSON.stringify({ autoEnableCodemode: "nope", mcpServers: {} }),
+      ];
+
+      for (const payload of invalidPayloads) {
+        await writeGlobalConfig(dir, {});
+        await mkdir(join(dir, ".pi"), { recursive: true });
+        await writeFile(join(dir, ".pi", "mcp.json"), payload);
+        await assert.rejects(
+          () => loadSessionConfigWithOrigins(dir, gPath, { includeProjectConfig: true }),
+          (err: unknown) => err instanceof McpError && err.code === "config",
+        );
+
+        await rm(join(dir, ".pi", "mcp.json"), { force: true });
+        await writeFile(gPath, payload);
+        await assert.rejects(
+          () => loadSessionConfigWithOrigins(dir, gPath, { includeProjectConfig: true }),
+          (err: unknown) => err instanceof McpError && err.code === "config",
+        );
+      }
     });
   });
 });
