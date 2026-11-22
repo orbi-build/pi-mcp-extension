@@ -1680,6 +1680,55 @@ describe("fuzz: resource bridge & /mcp:resources", () => {
     );
   });
 
+  it("convertMcpContent never throws on arbitrary image blocks and only emits valid base64 + canonical raster MIME", () => {
+    const supportedRasterMimes = new Set([
+      "image/png",
+      "image/jpeg",
+      "image/gif",
+      "image/webp",
+      "image/bmp",
+      "image/x-ms-bmp",
+      "image/tiff",
+    ]);
+    const imageBlockArb = fc.record(
+      {
+        type: fc.constant("image" as const),
+        data: fc.oneof(fc.anything(), arbitraryString),
+        mimeType: fc.oneof(
+          fc.anything(),
+          arbitraryString,
+          fc.constantFrom(
+            "image/png; charset=binary",
+            "IMAGE/JPG",
+            "image/svg+xml; charset=utf-8",
+            "image/bmp",
+            "image/tiff",
+            "image/x-icon\x1b[31m",
+          ),
+        ),
+      },
+      { requiredKeys: ["type"] },
+    );
+
+    fc.assert(
+      fc.property(imageBlockArb, (block) => {
+        const [out] = convertMcpContent([block]);
+        assert.ok(out);
+        if (out.type === "image") {
+          assert.ok(supportedRasterMimes.has(out.mimeType), `unexpected mimeType: ${out.mimeType}`);
+          assert.ok(out.data.length > 0 && out.data.length % 4 === 0);
+          assert.match(out.data, /^[A-Za-z0-9+/]+={0,2}$/);
+        } else {
+          assert.equal(out.type, "text");
+          if (out.text.startsWith("[Image omitted: ")) {
+            assert.ok(!/[\x00-\x1f\x7f-\x9f]/.test(out.text));
+          }
+        }
+      }),
+      testOptions(),
+    );
+  });
+
   it("sanitizeServerInstructions strips controls, masks credentials, bounds to <= 500 chars, and is idempotent", () => {
     fc.assert(
       fc.property(

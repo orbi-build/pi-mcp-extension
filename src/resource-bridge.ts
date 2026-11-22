@@ -283,6 +283,83 @@ export function convertResourceContent(item: unknown): PiResourceContent {
   return { type: "text", text: `[Resource: ${resolveResourceUri(entry["uri"])}]` };
 }
 
+const SUPPORTED_IMAGE_MIME_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  // WHY: Pi 1.3.0 Photon WASM cleanly transcodes valid BMP and TIFF payloads into image/png.
+  "image/bmp",
+  "image/x-ms-bmp",
+  "image/tiff",
+]);
+const STANDARD_BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+const MIME_FALLBACK_MAX_LENGTH = 100;
+
+export function canonicalizeImageMimeType(raw: unknown, fallback: string): string {
+  if (typeof raw !== "string") return fallback;
+  const semi = raw.indexOf(";");
+  const base = (semi === -1 ? raw : raw.slice(0, semi)).trim().toLowerCase();
+  if (base.length === 0) return fallback;
+  return base === "image/jpg" ? "image/jpeg" : base;
+}
+
+function normalizeBase64Payload(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  // WHY: Strip only WHATWG ASCII whitespace (matching atob) rather than /\s+/ so stray Unicode
+  // whitespace in corrupted payloads is rejected instead of silently swallowed.
+  const clean = raw.replace(/[\t\n\f\r ]+/g, "");
+  if (clean.length === 0 || clean.length % 4 !== 0 || !STANDARD_BASE64_RE.test(clean)) {
+    return null;
+  }
+  return clean;
+}
+
+function formatInvalidImageFallback(safeMime: string, uri?: string): PiResourceContent {
+  const text = uri === undefined
+    ? "[Image omitted: empty or invalid base64 payload]"
+    : `[Binary resource: ${uri} (${safeMime}, empty or invalid base64 payload)]`;
+  return { type: "text", text };
+}
+
+function formatUnsupportedImageFallback(
+  safeMime: string,
+  cleanBase64: string,
+  uri?: string,
+): PiResourceContent {
+  const text = uri === undefined
+    ? `[Image omitted: unsupported image type (${safeMime})]`
+    : `[Binary resource: ${uri} (${safeMime}, ${Buffer.byteLength(cleanBase64, "base64")} bytes)]`;
+  return { type: "text", text };
+}
+
+/**
+ * Validate and normalize an MCP `image` block or `image/*` blob resource into a Pi content block.
+ *
+ * WHY: Non-raster (`image/svg+xml`), parameterized, empty, or invalid image payloads fail Photon
+ * normalization in Pi 1.3.0 and remain in session history verbatim, triggering HTTP 400 / unknown
+ * image type rejections across Bedrock, Anthropic, and OpenAI adapters.
+ */
+export function convertImagePayload(
+  rawData: unknown,
+  rawMimeType: unknown,
+  options?: { defaultMimeType?: string; uri?: string },
+): PiResourceContent {
+  const canonicalMime = canonicalizeImageMimeType(rawMimeType, options?.defaultMimeType ?? "image/png");
+  const safeMime = sanitizeTerminalText(canonicalMime, { maxLength: MIME_FALLBACK_MAX_LENGTH }) || "unknown";
+  const clean = normalizeBase64Payload(rawData);
+  if (clean === null) {
+    return formatInvalidImageFallback(safeMime, options?.uri);
+  }
+  if (canonicalMime === "image/svg+xml") {
+    return { type: "text", text: Buffer.from(clean, "base64").toString("utf8") };
+  }
+  if (SUPPORTED_IMAGE_MIME_TYPES.has(canonicalMime)) {
+    return { type: "image", data: clean, mimeType: canonicalMime };
+  }
+  return formatUnsupportedImageFallback(safeMime, clean, options?.uri);
+}
+
 function resolveBlobMimeType(raw: unknown): string {
   const trimmed = typeof raw === "string" ? raw.trim() : "";
   return trimmed.length > 0 ? trimmed : "application/octet-stream";
@@ -290,12 +367,13 @@ function resolveBlobMimeType(raw: unknown): string {
 
 function convertBlobResource(entry: Record<string, unknown>): PiResourceContent {
   const uri = resolveResourceUri(entry["uri"]);
-  const mimeType = resolveBlobMimeType(entry["mimeType"]);
+  const rawMime = resolveBlobMimeType(entry["mimeType"]);
+  const canonicalMime = canonicalizeImageMimeType(rawMime, "application/octet-stream");
   const blob = entry["blob"] as string;
-  if (mimeType.startsWith("image/")) {
-    return { type: "image", data: blob, mimeType };
+  if (canonicalMime.startsWith("image/")) {
+    return convertImagePayload(blob, rawMime, { defaultMimeType: canonicalMime, uri });
   }
-  return { type: "text", text: `[Binary resource: ${uri} (${mimeType}, ${Buffer.byteLength(blob, "base64")} bytes)]` };
+  return { type: "text", text: `[Binary resource: ${uri} (${rawMime}, ${Buffer.byteLength(blob, "base64")} bytes)]` };
 }
 
 // ─── Resource bridge ──────────────────────────────────────────────────────────

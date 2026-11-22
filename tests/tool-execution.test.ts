@@ -10,6 +10,7 @@ import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { ErrorCode, McpError as SdkMcpError } from "@modelcontextprotocol/sdk/types.js";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { AuthCancelledError, McpError } from "../src/errors.js";
+import { buildToolCallOutcome, convertMcpContent } from "../src/tool-content.js";
 import {
   discoverServerTools,
   readClientInstructions,
@@ -250,10 +251,12 @@ describe("tool-execution: rethrowToolCallError and executeMcpToolCall", () => {
         err.message === "invalid query syntax",
     );
 
+    const TINY_PNG =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
     const isErrorEmptyClient = {
       callTool: async () => ({
         isError: true,
-        content: [{ type: "image", data: "abc", mimeType: "image/png" }],
+        content: [{ type: "image", data: TINY_PNG, mimeType: "image/png" }],
       }),
     } as unknown as Client;
     await assert.rejects(
@@ -415,6 +418,127 @@ describe("tool-execution: createPiToolDefinition and toHiddenToolDefinition", ()
 
     assert.deepEqual(seenTimeouts, [2500, 2500, 9000]);
     assert.deepEqual(authEvents, ["srv"]);
+  });
+});
+
+describe("tool-content: image MIME canonicalization, SVG decoding, and payload validation", () => {
+  const SAMPLE_BASE64 = "YWJj";
+  const SVG_MARKUP = '<svg xmlns="http://www.w3.org/2000/svg"><circle r="5"/></svg>';
+  const SVG_BASE64 = Buffer.from(SVG_MARKUP, "utf8").toString("base64");
+
+  it("decodes image/svg+xml (including uppercase and parameters) to UTF-8 text while preserving structuredContent", () => {
+    const outcome = buildToolCallOutcome(
+      {
+        content: [
+          { type: "image", data: SVG_BASE64, mimeType: "image/svg+xml" },
+          { type: "image", data: SVG_BASE64, mimeType: "IMAGE/SVG+XML; charset=utf-8" },
+        ],
+      },
+      "srv",
+      true,
+    );
+
+    assert.deepEqual(outcome.content, [
+      { type: "text", text: SVG_MARKUP },
+      { type: "text", text: SVG_MARKUP },
+    ]);
+    assert.deepEqual(outcome.structuredContent, {
+      content: [
+        { type: "image", data: SVG_BASE64, mimeType: "image/svg+xml" },
+        { type: "image", data: SVG_BASE64, mimeType: "IMAGE/SVG+XML; charset=utf-8" },
+      ],
+    });
+  });
+
+  it("canonicalizes parameterized and jpg MIME types, preserves BMP/TIFF for Photon, and strips ASCII whitespace", () => {
+    const out = convertMcpContent([
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/png; charset=binary" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "IMAGE/PNG; foo=bar" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/jpg" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "IMAGE/JPG; charset=binary" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/bmp" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/x-ms-bmp" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/tiff" },
+      { type: "image", data: " YWJj \r\n\t ", mimeType: "image/webp" },
+    ]);
+
+    assert.deepEqual(out, [
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/png" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/png" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/jpeg" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/jpeg" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/bmp" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/x-ms-bmp" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/tiff" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/webp" },
+    ]);
+  });
+
+  it("degrades empty, invalid, and non-string image payloads (including empty SVG) to omission text without throwing", () => {
+    const invalidInputs = [
+      { type: "image", data: "", mimeType: "image/png" },
+      { type: "image", data: "   \n\t  ", mimeType: "image/png" },
+      { type: "image", data: "abc", mimeType: "image/png" },
+      { type: "image", data: "====", mimeType: "image/png" },
+      { type: "image", data: "a===", mimeType: "image/png" },
+      { type: "image", data: "ab=c", mimeType: "image/png" },
+      { type: "image", data: "ab-_", mimeType: "image/png" },
+      { type: "image", data: 1234, mimeType: "image/png" },
+      { type: "image", data: { toString: false }, mimeType: { toString: false } },
+      { type: "image", data: "", mimeType: "image/svg+xml" },
+      { type: "image", data: "abc", mimeType: "image/svg+xml" },
+    ];
+
+    const out = convertMcpContent(invalidInputs);
+    for (const block of out) {
+      assert.deepEqual(block, {
+        type: "text",
+        text: "[Image omitted: empty or invalid base64 payload]",
+      });
+    }
+  });
+
+  it("degrades unsupported image MIME types to sanitized omission text", () => {
+    const out = convertMcpContent([
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/x-icon" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/heic; profile=main" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "application/pdf" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/x-icon\u001b[31m" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "\u001b[31m" },
+    ]);
+
+    assert.deepEqual(out, [
+      { type: "text", text: "[Image omitted: unsupported image type (image/x-icon)]" },
+      { type: "text", text: "[Image omitted: unsupported image type (image/heic)]" },
+      { type: "text", text: "[Image omitted: unsupported image type (application/pdf)]" },
+      { type: "text", text: "[Image omitted: unsupported image type (image/x-icon)]" },
+      { type: "text", text: "[Image omitted: unsupported image type (unknown)]" },
+    ]);
+  });
+
+  it("never leaks broken ImageContent from isError: true tool responses", () => {
+    assert.throws(
+      () =>
+        buildToolCallOutcome(
+          { isError: true, content: [{ type: "image", data: "", mimeType: "image/png" }] },
+          "srv",
+          false,
+        ),
+      (err: unknown) =>
+        err instanceof McpError &&
+        err.code === "tool" &&
+        err.message === "[Image omitted: empty or invalid base64 payload]",
+    );
+
+    const structured = buildToolCallOutcome(
+      { isError: true, content: [{ type: "image", data: "abc", mimeType: "image/svg+xml" }] },
+      "srv",
+      true,
+    );
+    assert.equal(structured.isError, true);
+    assert.deepEqual(structured.content, [
+      { type: "text", text: "[Image omitted: empty or invalid base64 payload]" },
+    ]);
   });
 });
 
