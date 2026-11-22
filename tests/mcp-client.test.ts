@@ -10,13 +10,21 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { pathToFileURL } from "node:url";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { ErrorCode, McpError as SdkMcpError } from "@modelcontextprotocol/sdk/types.js";
+import {
+  CallToolRequestSchema,
+  ErrorCode,
+  ListToolsRequestSchema,
+  McpError as SdkMcpError,
+} from "@modelcontextprotocol/sdk/types.js";
 import {
   buildWorkspaceRoot,
   connectClientWithTimeout,
   createConnectRaceGuard,
   createMcpClient,
+  createResilientOutputSchemaValidator,
   formatServerLogNotification,
   pingClientWithTimeout,
   rethrowNormalizedConnectError,
@@ -572,5 +580,144 @@ describe("createMcpClient", () => {
     });
 
     assert.deepEqual(lines, ["[error] db: connection lost"]);
+  });
+
+  it("discovers and executes tools even when one tool has a non-Unicode outputSchema pattern while keeping strict validation for healthy tools (#329)", async () => {
+    const server = new Server(
+      { name: "test-output-schema", version: "1.0.0" },
+      { capabilities: { tools: {} } },
+    );
+    let returnBadHealthyOutput = false;
+    let omitStructuredContent = false;
+
+    server.setRequestHandler(ListToolsRequestSchema, async () => ({
+      tools: [
+        {
+          name: "output_bad_pattern",
+          inputSchema: { type: "object", properties: {} },
+          outputSchema: {
+            type: "object",
+            properties: {
+              code: { type: "string", pattern: "(?i)^[a-z]+$" },
+            },
+            required: ["code"],
+          },
+        },
+        {
+          name: "healthy_sibling",
+          inputSchema: { type: "object", properties: {} },
+          outputSchema: {
+            type: "object",
+            properties: {
+              ok: { type: "string", pattern: "^[a-z]+$" },
+            },
+            required: ["ok"],
+          },
+        },
+      ],
+    }));
+
+    server.setRequestHandler(CallToolRequestSchema, async (req) => {
+      if (req.params.name === "output_bad_pattern") {
+        if (omitStructuredContent) {
+          return { content: [{ type: "text", text: "missing" }] };
+        }
+        return {
+          content: [{ type: "text", text: "ok" }],
+          structuredContent: { code: "ABC" },
+        };
+      }
+      if (returnBadHealthyOutput) {
+        return {
+          content: [{ type: "text", text: "bad" }],
+          structuredContent: { ok: "INVALID_UPPER" },
+        };
+      }
+      return {
+        content: [{ type: "text", text: "yes" }],
+        structuredContent: { ok: "yes" },
+      };
+    });
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = createMcpClient({
+      serverName: "bad",
+      getCwd: () => "/tmp",
+      onToolsChanged: async () => {},
+      onResourcesChanged: () => {},
+      onLogLine: () => {},
+    });
+
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const listed = await client.listTools();
+      assert.deepEqual(
+        listed.tools.map((t) => t.name),
+        ["output_bad_pattern", "healthy_sibling"],
+      );
+
+      const badPatternRes = await client.callTool({ name: "output_bad_pattern", arguments: {} });
+      assert.deepEqual(badPatternRes.structuredContent, { code: "ABC" });
+
+      omitStructuredContent = true;
+      await assert.rejects(
+        () => client.callTool({ name: "output_bad_pattern", arguments: {} }),
+        /has an output schema but did not return structured content/,
+      );
+
+      const healthyRes = await client.callTool({ name: "healthy_sibling", arguments: {} });
+      assert.deepEqual(healthyRes.structuredContent, { ok: "yes" });
+
+      returnBadHealthyOutput = true;
+      await assert.rejects(
+        () => client.callTool({ name: "healthy_sibling", arguments: {} }),
+        /Structured content does not match the tool's output schema/,
+      );
+    } finally {
+      await Promise.all([client.close(), server.close()]);
+    }
+  });
+});
+
+describe("createResilientOutputSchemaValidator (#329)", () => {
+  it("validates compilable schemas strictly and falls back to pass-through on non-/u patterns or patternProperties", () => {
+    const provider = createResilientOutputSchemaValidator("srv");
+
+    const strict = provider.getValidator<{ ok: string }>({
+      type: "object",
+      properties: { ok: { type: "string", pattern: "^[a-z]+$" } },
+      required: ["ok"],
+    });
+    assert.deepEqual(strict({ ok: "abc" }), {
+      valid: true,
+      data: { ok: "abc" },
+      errorMessage: undefined,
+    });
+    const failed = strict({ ok: "BAD" });
+    assert.equal(failed.valid, false);
+    assert.ok(failed.errorMessage);
+
+    for (const badPattern of ["(?i)^[a-z]+$", "\\A[a-z0-9-]+\\z", "^[\\w-\\.]+$", "([a-z"]) {
+      const validator = provider.getValidator({
+        type: "object",
+        properties: { code: { type: "string", pattern: badPattern } },
+      });
+      const sample = { code: "ABC" };
+      assert.deepEqual(validator(sample), {
+        valid: true,
+        data: sample,
+        errorMessage: undefined,
+      });
+    }
+
+    const badPatternProps = provider.getValidator({
+      type: "object",
+      patternProperties: { "(?i)^k_": { type: "string" } },
+    });
+    assert.deepEqual(badPatternProps({ k_1: "v" }), {
+      valid: true,
+      data: { k_1: "v" },
+      errorMessage: undefined,
+    });
   });
 });

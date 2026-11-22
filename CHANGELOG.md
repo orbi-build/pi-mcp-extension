@@ -6,6 +6,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- Omit non-Unicode (`/u`) or malformed regex `pattern` strings during MCP `inputSchema` → TypeBox conversion and wrap `Client`'s `outputSchema` Ajv validator so PCRE/Python/Go regexes (such as `(?i)^[a-z]+$`, `\A...\z`, `^[\w-\.]+$`, or unterminated expressions) no longer crash tool calls or fail `tools/list` for the entire server while valid `/u` patterns remain strictly enforced (#329).
+- Prevent `Object.prototype` key collisions (`toString`, `constructor`, `valueOf`, `hasOwnProperty`, `prototype`, `__proto__`) from dropping properties in `allOf` flattening, mutating local prototype chains, stripping own keys during TypeBox `Type.Optional` / `Type.Unsafe` cloning, or crashing tool registration when schemas declare prototype-named `type` strings (#330).
+
 ## [1.16.0] - 2026-11-22
 
 ### Added
