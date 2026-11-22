@@ -92,7 +92,7 @@ async function handleMcpStart(
   ctx: ExtensionCommandContext,
   deps: RegisterCommandsDeps,
 ): Promise<void> {
-  const { manager, coordinator } = deps;
+  const { manager, coordinator, bridge } = deps;
   const serverName = args.trim();
   if (!serverName) {
     ctx.ui.notify("Usage: /mcp:start <server-name>", "error");
@@ -104,7 +104,16 @@ async function handleMcpStart(
   }
   try {
     await coordinator.connect(serverName, ctx);
-    ctx.ui.notify(`pi-mcp: Started ${serverName}`, "info");
+    bridge.restoreTreeDeactivatedDirectTools(serverName);
+    const inactiveDirect = bridge.getInactiveDirectTools(serverName);
+    if (inactiveDirect.length > 0) {
+      ctx.ui.notify(
+        `pi-mcp: Started ${serverName}, but ${inactiveDirect.length} direct tool(s) remain inactive — run /mcp ${serverName} for details`,
+        "warning",
+      );
+    } else {
+      ctx.ui.notify(`pi-mcp: Started ${serverName}`, "info");
+    }
   } catch (err) {
     if (err instanceof AuthCancelledError) {
       ctx.ui.notify(`pi-mcp: ${sanitizeTerminalText(err.message)}`, "info");
